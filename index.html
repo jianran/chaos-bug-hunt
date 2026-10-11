@@ -123,8 +123,8 @@ try { leaderboard = JSON.parse(localStorage.getItem("bughunter_leaderboard") || 
 function saveLeaderboard() {
   try { localStorage.setItem("bughunter_leaderboard", JSON.stringify(leaderboard)); } catch (e) { /* ignore */ }
 }
-function computeLeaderboardAfter(entry) {
-  const merged = leaderboard.concat([entry]).sort((a, b) => b.score - a.score);
+function placeOnBoard(board, entry, compare) { // sorted merge, a podium of 3 different names, capped at 10 (shared by both boards)
+  const merged = board.concat([entry]).sort(compare);
   const podium = [], rest = [], seen = new Set();
   for (const e of merged) {
     if (podium.length < LEADERBOARD_PODIUM && !seen.has(e.name)) { podium.push(e); seen.add(e.name); }
@@ -133,6 +133,15 @@ function computeLeaderboardAfter(entry) {
   const full = podium.concat(rest);
   return { kept: full.slice(0, LEADERBOARD_MAX), dropped: full.slice(LEADERBOARD_MAX) };
 }
+function computeLeaderboardAfter(entry) { return placeOnBoard(leaderboard, entry, (a, b) => b.score - a.score); }
+
+/* The level leaderboard: the highest level reached in a run, ties by score then by the earlier run. No clips. */
+let levelBoard = []; // [{ name, level, score }], best first
+try { const saved = JSON.parse(localStorage.getItem("bughunter_levelboard") || "[]"); levelBoard = Array.isArray(saved) ? saved : []; } catch (e) { levelBoard = []; }
+function saveLevelBoard() {
+  try { localStorage.setItem("bughunter_levelboard", JSON.stringify(levelBoard)); } catch (e) { /* ignore */ }
+}
+function computeLevelBoardAfter(entry) { return placeOnBoard(levelBoard, entry, (a, b) => (b.level - a.level) || (b.score - a.score)); }
 let LEADERBOARD_CLEAR_LENGTH = 12; // length of the secret clear code
 let LEADERBOARD_CLEAR_HASH = 8358130821886589; // hashText() of the secret clear code; the code itself is stored nowhere (a hash obscures, it is not encryption)
 let leaderboardCodeBuffer = ""; // the last few characters typed outside a run
@@ -152,13 +161,25 @@ function hashText(s) { // cyrb53, a small public-domain 53-bit string hash. It o
 function clearLeaderboard() {
   leaderboard = [];
   saveLeaderboard();
+  levelBoard = [];
+  saveLevelBoard();
   clearAllVideoBlobs().catch(() => {}); // the saved clips go with the scores
   clearLeaderboardVideos(); // thumbnails (and a zoomed clip) currently on screen
-  pushToast("Leaderboard cleared");
+  pushToast("Leaderboards cleared");
 }
 let zoomedVideoEl = null;
 let leaderboardVideoEls = [];
-function enterLeaderboard() { state = "leaderboard"; renderLeaderboardVideos(); }
+let boardPage = "points"; // which leaderboard page is showing: "points" or "levels"
+function enterLeaderboard(page) { // always opens on POINTS unless told otherwise
+  state = "leaderboard";
+  boardPage = page === "levels" ? "levels" : "points";
+  if (boardPage === "points") renderLeaderboardVideos(); else clearLeaderboardVideos();
+}
+function showBoardPage(page) { // POINTS keeps the clip thumbnails; LEVELS has none
+  if (state !== "leaderboard" || page === boardPage) return;
+  boardPage = page;
+  if (page === "points") renderLeaderboardVideos(); else clearLeaderboardVideos();
+}
 function exitLeaderboard() { state = "menu"; clearLeaderboardVideos(); }
 function closeZoom() {
   if (zoomedVideoEl) { zoomedVideoEl.remove(); zoomedVideoEl = null; }
@@ -175,7 +196,7 @@ async function renderLeaderboardVideos() {
     const e = leaderboard[i];
     if (!e.videoId) continue;
     const blob = await loadVideoBlob(e.videoId);
-    if (!blob || state !== "leaderboard") continue; // board may have closed while this awaited
+    if (!blob || state !== "leaderboard" || boardPage !== "points") continue; // the board may have closed, or flipped to LEVELS, while this awaited
     const vid = document.createElement("video");
     vid.src = URL.createObjectURL(blob);
     vid.muted = true;
@@ -308,6 +329,7 @@ function start() {
   leaderboardCodeBuffer = ""; // a half-typed secret code doesn't carry into the run
   touch.stickId = null; touch.fireId = null; touch.dx = 0; touch.dy = 0; // let go of any held touch
   blurNameField(); // dismiss the phone keyboard
+  gesture = null;
   spawnTimer = 0.4;
   level = 1; levelKills = 0; quota = quotaFor(level); phase = "intro"; phaseTimer = 2;
   state = "playing";
@@ -358,11 +380,19 @@ addEventListener("keydown", (e) => {
   if (k === "l" && state === "menu") enterLeaderboard();
   else if (k === "l" && state === "leaderboard") exitLeaderboard();
   if (e.key === "Escape" && state === "leaderboard") { if (zoomedVideoEl) closeZoom(); else exitLeaderboard(); }
+  if (e.key === "ArrowDown" && state === "menu") enterLeaderboard("levels"); // the menu's shortcut to the level board
+  else if (e.key === "ArrowDown" && state === "leaderboard") showBoardPage("levels");
+  else if (e.key === "ArrowUp" && state === "leaderboard") showBoardPage("points");
 });
 addEventListener("keyup", (e) => { keys[e.key] = false; keys[e.key.toLowerCase()] = false; });
-canvas.addEventListener("mousedown", () => {
+canvas.addEventListener("mousedown", (e) => {
   audio();
   if (state === "menu" || state === "gameover") { nameInput = playerName; state = "naming"; }
+  else if (state === "leaderboard") { // a mouse click on a tab switches pages
+    const p = canvasPoint(e);
+    if (inRect(p, TAB_POINTS)) showBoardPage("points");
+    else if (inRect(p, TAB_LEVELS)) showBoardPage("levels");
+  }
 });
 
 /* ---------------- touch input (phones and tablets) ----------------
@@ -413,6 +443,28 @@ function openNaming(viaTouch) {
   if (viaTouch) focusNameField();
 }
 if (nameField) nameField.addEventListener("input", () => { if (state === "naming") nameInput = nameField.value.slice(0, NAME_MAX_LEN); });
+
+/* Taps and swipes on the menu and the leaderboard screen: a finger that goes down is remembered, and what it meant is
+   decided when it lifts (under 24 canvas px is a tap, a mostly vertical drag of 60+ px is a swipe, anything else is ignored). */
+const SWIPE_MIN = 60, TAP_SLOP = 24;
+let gesture = null; // { id, x, y, state } for the finger that went down on the menu or the leaderboard screen
+function flipBoardPage() { showBoardPage(boardPage === "points" ? "levels" : "points"); }
+function onSwipe(dir) { // dir: "up" or "down"
+  if (state === "menu" && dir === "down") enterLeaderboard("levels"); // the menu: swipe down shows the level board
+  else if (state === "leaderboard") flipBoardPage(); // the leaderboard: any vertical swipe flips the page, so the direction can't be wrong
+}
+function onTap(p) {
+  if (state === "menu") {
+    if (inRect(p, MENU_LB_BTN)) enterLeaderboard();
+    else if (inRect(p, MODE_PREV)) changeMenuMode(-1);
+    else if (inRect(p, MODE_NEXT)) changeMenuMode(1);
+    else openNaming(true);
+  } else if (state === "leaderboard") {
+    if (inRect(p, TAB_POINTS)) showBoardPage("points");
+    else if (inRect(p, TAB_LEVELS)) showBoardPage("levels");
+    else if (!zoomedVideoEl) exitLeaderboard();
+  }
+}
 function canvasPoint(e) { // a pointer position in canvas pixels, whatever size the canvas is scaled to
   const r = canvas.getBoundingClientRect();
   return { x: (e.clientX - r.left) * (W / r.width), y: (e.clientY - r.top) * (H / r.height) };
@@ -432,15 +484,11 @@ canvas.addEventListener("pointerdown", (e) => {
     try { canvas.setPointerCapture(e.pointerId); } catch (err) { /* ignore */ }
   } else if (state === "paused") {
     state = "playing";
-  } else if (state === "menu") {
-    if (inRect(p, MENU_LB_BTN)) enterLeaderboard();
-    else if (inRect(p, MODE_PREV)) changeMenuMode(-1);
-    else if (inRect(p, MODE_NEXT)) changeMenuMode(1);
-    else openNaming(true);
+  } else if (state === "menu" || state === "leaderboard") { // these act when the finger lifts (see releaseTouch), so a swipe can't be mistaken for a tap
+    gesture = { id: e.pointerId, x: p.x, y: p.y, state: state };
+    try { canvas.setPointerCapture(e.pointerId); } catch (err) { /* ignore */ }
   } else if (state === "gameover") {
     openNaming(true);
-  } else if (state === "leaderboard") {
-    if (!zoomedVideoEl) exitLeaderboard();
   } else if (state === "naming") {
     if (inRect(p, NAME_OK_BTN)) confirmName();
     else if (inRect(p, NAME_CANCEL_BTN)) { state = "menu"; blurNameField(); }
@@ -458,9 +506,23 @@ canvas.addEventListener("pointermove", (e) => {
 function releaseTouch(e) {
   if (e.pointerId === touch.stickId) { touch.stickId = null; touch.dx = 0; touch.dy = 0; }
   if (e.pointerId === touch.fireId) touch.fireId = null;
+  if (gesture && e.pointerId === gesture.id) { // a finger lifted on the menu or the leaderboard: was it a tap or a swipe?
+    const g = gesture;
+    gesture = null;
+    if (e.type === "pointercancel" || state !== g.state) return; // cancelled, or the screen changed in the meantime
+    const p = canvasPoint(e);
+    const dx = p.x - g.x, dy = p.y - g.y;
+    if (Math.abs(dy) >= SWIPE_MIN && Math.abs(dy) >= 1.5 * Math.abs(dx)) onSwipe(dy > 0 ? "down" : "up");
+    else if (Math.hypot(dx, dy) <= TAP_SLOP) onTap({ x: g.x, y: g.y });
+  }
 }
 canvas.addEventListener("pointerup", releaseTouch);
 canvas.addEventListener("pointercancel", releaseTouch);
+const TAB_POINTS = { x: W / 2 - 170, y: 94, w: 150, h: 36 }, TAB_LEVELS = { x: W / 2 + 20, y: 94, w: 150, h: 36 }; // the POINTS | LEVELS tabs
+canvas.addEventListener("wheel", (e) => { // scrolling moves between the two leaderboard pages: down is LEVELS, up is POINTS
+  if (state !== "leaderboard" || e.ctrlKey || Math.abs(e.deltaY) < 8) return;
+  showBoardPage(e.deltaY > 0 ? "levels" : "points");
+});
 
 /* ---------------- helpers ---------------- */
 function burst(x, y, color, n) {
@@ -612,6 +674,8 @@ function hitPlayer(b) {
 }
 
 function finishRun() {
+  levelBoard = computeLevelBoardAfter({ name: playerName, level: level, score: score }).kept; // needs no clip, so it is recorded at once
+  saveLevelBoard();
   const entry = { name: playerName, score: score, videoId: null };
   const { kept, dropped } = computeLeaderboardAfter(entry);
   const commit = () => {
@@ -1200,15 +1264,28 @@ function drawNaming(t) {
   }
 }
 
-function drawLeaderboard(t) {
+function drawBoardTabs() { // POINTS | LEVELS under the title: the current page is bright and underlined
+  ctx.font = "bold 18px 'Segoe UI', sans-serif";
+  ctx.textAlign = "center";
+  [["POINTS", TAB_POINTS, "points"], ["LEVELS", TAB_LEVELS, "levels"]].forEach(([label, r, page]) => {
+    const active = boardPage === page;
+    ctx.fillStyle = active ? "#ffffff" : "rgba(255,255,255,0.4)";
+    ctx.fillText(label, r.x + r.w / 2, r.y + 24);
+    if (active) ctx.fillRect(r.x + r.w / 2 - 34, r.y + 30, 68, 3);
+  });
+}
+function drawLeaderboard(t) { // the POINTS page or the LEVELS page
+  const levels = boardPage === "levels";
   ctx.fillStyle = "rgba(5,8,20,0.75)";
   ctx.fillRect(0, 0, W, H);
   ctx.shadowColor = "#ffd700";
   ctx.shadowBlur = 20;
-  centerText("LEADERBOARD", W / 2, 80, 44, "#ffffff");
+  centerText(levels ? "LEVEL LEADERBOARD" : "LEADERBOARD", W / 2, 80, 44, "#ffffff");
   ctx.shadowBlur = 0;
+  drawBoardTabs();
+  const rows = levels ? levelBoard : leaderboard;
   const startY = 150, rowH = 40;
-  leaderboard.forEach((e, i) => {
+  rows.forEach((e, i) => {
     const y = startY + i * rowH;
     const rankColor = i === 0 ? "#ffd700" : i === 1 ? "#c0c0c0" : i === 2 ? "#cd7f32" : "rgba(255,255,255,0.85)";
     ctx.textAlign = "left";
@@ -1217,18 +1294,24 @@ function drawLeaderboard(t) {
     ctx.fillText((i + 1) + ".", W / 2 - 260, y);
     ctx.fillText(e.name, W / 2 - 220, y);
     const nameW = ctx.measureText(e.name).width;
-    const scoreText = e.score + " points";
+    const mainText = levels ? "Level " + e.level : e.score + " points";
     ctx.font = "16px 'Segoe UI', sans-serif";
-    const scoreW = ctx.measureText(scoreText).width;
-    const dashesX = W / 2 - 220 + nameW + 10, dashesEndX = W / 2 + 150 - scoreW;
+    const mainW = ctx.measureText(mainText).width;
+    const dashesX = W / 2 - 220 + nameW + 10, dashesEndX = W / 2 + 150 - mainW;
     ctx.fillStyle = "rgba(255,255,255,0.35)";
     if (dashesEndX > dashesX) ctx.fillText("-".repeat(Math.max(3, Math.floor((dashesEndX - dashesX) / 8))), dashesX, y);
     ctx.fillStyle = rankColor;
     ctx.textAlign = "right";
-    ctx.fillText(scoreText, W / 2 + 160, y);
+    ctx.fillText(mainText, W / 2 + 160, y);
+    if (levels) { // the score breaks ties between equal levels, so show it in small text
+      ctx.font = "14px 'Segoe UI', sans-serif";
+      ctx.fillStyle = "rgba(255,255,255,0.5)";
+      ctx.fillText(e.score + " pts", W / 2 + 260, y);
+    }
   });
-  if (leaderboard.length === 0) centerText("No runs yet — go set the first score!", W / 2, startY + 40, 18, "rgba(255,255,255,0.6)");
-  centerText(touchMode ? "tap anywhere to return to the menu" : "L / Esc to return to the menu", W / 2, H - 40, 14, "rgba(255,255,255,0.5)");
+  if (rows.length === 0) centerText(levels ? "No runs yet — reach a level to get on the board!" : "No runs yet — go set the first score!", W / 2, startY + 40, 18, "rgba(255,255,255,0.6)");
+  const flip = levels ? (touchMode ? "swipe for POINTS" : "↑ or scroll for POINTS") : (touchMode ? "swipe down for LEVELS" : "↓ or scroll for LEVELS");
+  centerText(flip + "  •  " + (touchMode ? "tap anywhere to return to the menu" : "L / Esc to return to the menu"), W / 2, H - 40, 14, "rgba(255,255,255,0.5)");
 }
 
 function drawMenu(t) {
