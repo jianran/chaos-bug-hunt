@@ -116,13 +116,18 @@ try { playerName = localStorage.getItem("bughunter_last_name") || ""; } catch (e
 let nameInput = "";
 const NAME_MAX_LEN = 12;
 
+let BOARD_API = "https://chaos-bug-hunt-board.tanfanhua.workers.dev"; // address of the shared leaderboard service; "" keeps both boards on this device only (the kill switch)
+function sharedBoardsOn() { return BOARD_API !== ""; }
 const LEADERBOARD_MAX = 10;
 const LEADERBOARD_PODIUM = 3;
 let leaderboard = [];
-try { leaderboard = JSON.parse(localStorage.getItem("bughunter_leaderboard") || "[]"); } catch (e) { leaderboard = []; }
+if (!sharedBoardsOn()) { try { leaderboard = JSON.parse(localStorage.getItem("bughunter_leaderboard") || "[]"); } catch (e) { leaderboard = []; } }
 function saveLeaderboard() {
+  if (sharedBoardsOn()) { saveBoards(); return; }
   try { localStorage.setItem("bughunter_leaderboard", JSON.stringify(leaderboard)); } catch (e) { /* ignore */ }
 }
+const BY_SCORE = (a, b) => b.score - a.score;
+const BY_LEVEL = (a, b) => (b.level - a.level) || (b.score - a.score);
 function placeOnBoard(board, entry, compare) { // sorted merge, a podium of 3 different names, capped at 10 (shared by both boards)
   const merged = board.concat([entry]).sort(compare);
   const podium = [], rest = [], seen = new Set();
@@ -133,15 +138,146 @@ function placeOnBoard(board, entry, compare) { // sorted merge, a podium of 3 di
   const full = podium.concat(rest);
   return { kept: full.slice(0, LEADERBOARD_MAX), dropped: full.slice(LEADERBOARD_MAX) };
 }
-function computeLeaderboardAfter(entry) { return placeOnBoard(leaderboard, entry, (a, b) => b.score - a.score); }
+function computeLeaderboardAfter(entry) { return placeOnBoard(leaderboard, entry, BY_SCORE); }
 
 /* The level leaderboard: the highest level reached in a run, ties by score then by the earlier run. No clips. */
 let levelBoard = []; // [{ name, level, score }], best first
-try { const saved = JSON.parse(localStorage.getItem("bughunter_levelboard") || "[]"); levelBoard = Array.isArray(saved) ? saved : []; } catch (e) { levelBoard = []; }
+if (!sharedBoardsOn()) { try { const saved = JSON.parse(localStorage.getItem("bughunter_levelboard") || "[]"); levelBoard = Array.isArray(saved) ? saved : []; } catch (e) { levelBoard = []; } }
 function saveLevelBoard() {
+  if (sharedBoardsOn()) { saveBoards(); return; }
   try { localStorage.setItem("bughunter_levelboard", JSON.stringify(levelBoard)); } catch (e) { /* ignore */ }
 }
-function computeLevelBoardAfter(entry) { return placeOnBoard(levelBoard, entry, (a, b) => (b.level - a.level) || (b.score - a.score)); }
+function computeLevelBoardAfter(entry) { return placeOnBoard(levelBoard, entry, BY_LEVEL); }
+
+/* The shared leaderboards (docs/superpowers/specs/2026-10-11-bug-hunter-shared-leaderboard-design.md). With BOARD_API set, the two
+   boards above are a display copy of the service's boards, cached in localStorage so the game starts with something to show, and
+   runs that could not be sent yet wait in pendingRuns. With BOARD_API empty none of this runs and the boards live on this device. */
+const PENDING_MAX = 20, PENDING_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000, BOARD_TIMEOUT_MS = 8000;
+let boardEpoch = null; // how many times the service's boards have been wiped, as last heard (null = never heard)
+let boardStatus = "idle"; // "idle" (nothing tried yet) | "loading" | "live" | "offline"
+let pendingRuns = []; // runs not sent yet, oldest first: [{ id, name, level, score, epoch, t }]
+function cleanEntry(e) { // one entry from the cache or the service, or null when it is not usable
+  if (!e || typeof e !== "object" || typeof e.name !== "string" || e.name.length === 0) return null;
+  if (!Number.isFinite(e.score) || !Number.isFinite(e.level)) return null;
+  return { id: typeof e.id === "string" ? e.id : null, name: e.name.slice(0, NAME_MAX_LEN), level: e.level, score: e.score };
+}
+function cleanBoard(list) { return Array.isArray(list) ? list.map(cleanEntry).filter(Boolean).slice(0, LEADERBOARD_MAX) : []; }
+function validPending(r) { // a waiting run read back from storage: well-formed and not older than a week
+  return !!r && typeof r === "object" && typeof r.id === "string" && typeof r.name === "string" && r.name.length > 0
+    && Number.isFinite(r.level) && Number.isFinite(r.score) && Number.isFinite(r.t) && Date.now() - r.t < PENDING_MAX_AGE_MS;
+}
+function saveBoards() {
+  try { localStorage.setItem("bughunter_shared", JSON.stringify({ points: leaderboard, levels: levelBoard, epoch: boardEpoch })); } catch (e) { /* ignore */ }
+}
+function savePending() {
+  try { localStorage.setItem("bughunter_pending", JSON.stringify(pendingRuns)); } catch (e) { /* ignore */ }
+}
+function loadSharedCache() {
+  try {
+    const saved = JSON.parse(localStorage.getItem("bughunter_shared") || "null");
+    if (saved && typeof saved === "object") {
+      leaderboard = cleanBoard(saved.points);
+      levelBoard = cleanBoard(saved.levels);
+      boardEpoch = Number.isInteger(saved.epoch) ? saved.epoch : null;
+    }
+  } catch (e) { /* an unreadable cache: start empty */ }
+  try {
+    const waiting = JSON.parse(localStorage.getItem("bughunter_pending") || "[]");
+    pendingRuns = Array.isArray(waiting) ? waiting.filter(validPending).slice(-PENDING_MAX) : [];
+  } catch (e) { pendingRuns = []; }
+}
+function boardApi(method, path, body) { // resolves with the service's JSON; rejects with an Error whose .status is the HTTP status (0 = no connection or timeout) and .data the JSON body, if any
+  return new Promise((resolve, reject) => {
+    let finished = false, timer = null;
+    const finish = (fn, value) => { if (finished) return; finished = true; clearTimeout(timer); fn(value); };
+    const fail = (message, status, data) => finish(reject, Object.assign(new Error(message), { status: status, data: data }));
+    if (typeof fetch !== "function") { fail("no fetch", 0); return; }
+    timer = setTimeout(() => fail("timeout", 0), BOARD_TIMEOUT_MS);
+    const init = { method: method, cache: "no-store" };
+    if (body !== undefined) { init.headers = { "Content-Type": "application/json" }; init.body = JSON.stringify(body); }
+    try {
+      fetch(BOARD_API + path, init)
+        .then((res) => res.json().then((data) => data, () => null).then((data) => {
+          if (res.ok && data) finish(resolve, data);
+          else fail("HTTP " + res.status, res.status, data);
+        }))
+        .catch(() => fail("network", 0));
+    } catch (e) { fail("network", 0); }
+  });
+}
+function refreshThumbnails() { // the POINTS board changed while it is on screen: rebuild the clip thumbnails (but never under a clip being watched)
+  if (state === "leaderboard" && boardPage === "points" && !zoomedVideoEl) renderLeaderboardVideos();
+}
+function applyBoards(data) { // adopt the service's boards, with any runs still waiting on top; false if the reply is unusable
+  if (!data || !Array.isArray(data.points) || !Array.isArray(data.levels)) return false;
+  if (Number.isInteger(data.epoch)) {
+    boardEpoch = data.epoch;
+    const kept = pendingRuns.filter((r) => !Number.isInteger(r.epoch) || r.epoch >= data.epoch); // runs from before a wipe would be refused anyway
+    if (kept.length !== pendingRuns.length) { pendingRuns = kept; savePending(); }
+  }
+  let points = cleanBoard(data.points), levels = cleanBoard(data.levels);
+  for (const r of pendingRuns) {
+    const run = { id: r.id, name: r.name.slice(0, NAME_MAX_LEN), level: r.level, score: r.score };
+    if (!points.some((e) => e.id === r.id)) points = placeOnBoard(points, Object.assign({}, run), BY_SCORE).kept;
+    if (!levels.some((e) => e.id === r.id)) levels = placeOnBoard(levels, Object.assign({}, run), BY_LEVEL).kept;
+  }
+  const changed = points.map((e) => e.id).join() !== leaderboard.map((e) => e.id).join();
+  leaderboard = points;
+  levelBoard = levels;
+  saveBoards();
+  if (changed) refreshThumbnails();
+  return true;
+}
+function newRunId() { return Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 10); }
+let clipSaving = Promise.resolve(); // settles once the clip of the latest run has been saved: thumbnails wait for it
+function clipKey(e) { return e.videoId || (e.id ? "run_" + e.id : null); } // where an entry's clip is kept (entries from before run ids remember theirs)
+function submitRun(run) { // queue a finished run and try to send it
+  pendingRuns.push({ id: run.id, name: run.name, level: run.level, score: run.score, epoch: boardEpoch, t: Date.now() });
+  if (pendingRuns.length > PENDING_MAX) pendingRuns.splice(0, pendingRuns.length - PENDING_MAX);
+  savePending();
+  return syncBoards();
+}
+function dropPending(run) { pendingRuns = pendingRuns.filter((r) => r !== run); savePending(); }
+async function flushPending() { // send the waiting runs, oldest first; resolves true if the service answered with boards at least once
+  let answered = false;
+  const fresh = pendingRuns.filter((r) => Date.now() - r.t < PENDING_MAX_AGE_MS);
+  if (fresh.length !== pendingRuns.length) { pendingRuns = fresh; savePending(); }
+  while (pendingRuns.length > 0) {
+    const r = pendingRuns[0];
+    let data;
+    try {
+      data = await boardApi("POST", "/runs", { id: r.id, name: r.name, level: r.level, score: r.score, epoch: r.epoch });
+    } catch (e) {
+      if (e.status !== 409 && e.status !== 400 && e.status !== 413) throw e; // no connection, slow down, or a server hiccup: keep the run for later
+      dropPending(r); // refused for good (a wipe happened, or the run was invalid): forget it
+      if (applyBoards(e.data)) answered = true; // a 409 carries the current boards
+      continue;
+    }
+    dropPending(r);
+    if (applyBoards(data)) answered = true;
+  }
+  return answered;
+}
+let syncPromise = null, syncAgain = false;
+function syncBoards() { // send the waiting runs, then refresh the boards; one sync at a time (a call made meanwhile earns exactly one more pass)
+  if (!sharedBoardsOn()) return Promise.resolve();
+  if (syncPromise) { syncAgain = true; return syncPromise; }
+  boardStatus = "loading";
+  syncPromise = (async () => {
+    try {
+      const answered = await flushPending();
+      if (!answered && !applyBoards(await boardApi("GET", "/boards"))) throw new Error("unusable reply");
+      boardStatus = "live";
+      await pruneClips();
+    } catch (e) {
+      boardStatus = "offline";
+    }
+    syncPromise = null;
+    if (syncAgain) { syncAgain = false; return syncBoards(); }
+  })();
+  return syncPromise;
+}
+if (sharedBoardsOn()) loadSharedCache();
 let LEADERBOARD_CLEAR_LENGTH = 12; // length of the secret clear code
 let LEADERBOARD_CLEAR_HASH = 8358130821886589; // hashText() of the secret clear code; the code itself is stored nowhere (a hash obscures, it is not encryption)
 let leaderboardCodeBuffer = ""; // the last few characters typed outside a run
@@ -158,7 +294,7 @@ function hashText(s) { // cyrb53, a small public-domain 53-bit string hash. It o
   h2 ^= Math.imul(h1 ^ (h1 >>> 13), 3266489909);
   return 4294967296 * (2097151 & h2) + (h1 >>> 0);
 }
-function clearLeaderboard() {
+function wipeLocalBoards() { // empty both boards and every saved clip on this device
   leaderboard = [];
   saveLeaderboard();
   levelBoard = [];
@@ -167,6 +303,17 @@ function clearLeaderboard() {
   clearLeaderboardVideos(); // thumbnails (and a zoomed clip) currently on screen
   pushToast("Leaderboards cleared");
 }
+function clearLeaderboard(code) { // the typed clear code: on its own device, or (shared mode) on the service for everybody, which checks the code itself
+  if (!sharedBoardsOn()) { wipeLocalBoards(); return Promise.resolve(); }
+  return boardApi("POST", "/clear", { code: code })
+    .then((data) => {
+      pendingRuns = []; // runs waiting from before the wipe would be refused anyway
+      savePending();
+      if (Number.isInteger(data.epoch)) boardEpoch = data.epoch;
+      wipeLocalBoards();
+    })
+    .catch(() => pushToast("Couldn't clear the shared boards"));
+}
 let zoomedVideoEl = null;
 let leaderboardVideoEls = [];
 let boardPage = "points"; // which leaderboard page is showing: "points" or "levels"
@@ -174,6 +321,7 @@ function enterLeaderboard(page) { // always opens on POINTS unless told otherwis
   state = "leaderboard";
   boardPage = page === "levels" ? "levels" : "points";
   if (boardPage === "points") renderLeaderboardVideos(); else clearLeaderboardVideos();
+  syncBoards(); // shared mode: refresh the boards from the service (a no-op otherwise)
 }
 function showBoardPage(page) { // POINTS keeps the clip thumbnails; LEVELS has none
   if (state !== "leaderboard" || page === boardPage) return;
@@ -189,13 +337,19 @@ function clearLeaderboardVideos() {
   leaderboardVideoEls = [];
   closeZoom();
 }
+let videoRenderToken = 0;
 async function renderLeaderboardVideos() {
+  const token = ++videoRenderToken; // a newer render replaces an older one that is still waiting on clips
   clearLeaderboardVideos();
   const stage = document.getElementById("stage");
+  await clipSaving; // a clip that is still being saved should show up too
+  if (token !== videoRenderToken) return;
   for (let i = 0; i < leaderboard.length; i++) {
-    const e = leaderboard[i];
-    if (!e.videoId) continue;
-    const blob = await loadVideoBlob(e.videoId);
+    const key = clipKey(leaderboard[i]);
+    if (!key) continue;
+    let blob = null;
+    try { blob = await loadVideoBlob(key); } catch (err) { blob = null; } // no IndexedDB (a private window, say): no thumbnails
+    if (token !== videoRenderToken) return;
     if (!blob || state !== "leaderboard" || boardPage !== "points") continue; // the board may have closed, or flipped to LEVELS, while this awaited
     const vid = document.createElement("video");
     vid.src = URL.createObjectURL(blob);
@@ -276,6 +430,20 @@ async function clearAllVideoBlobs() {
     tx.onerror = () => reject(tx.error);
   });
 }
+async function listVideoKeys() {
+  const db = await openVideoDb();
+  return new Promise((resolve, reject) => {
+    const req = db.transaction(DB_STORE, "readonly").objectStore(DB_STORE).getAllKeys();
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+async function pruneClips() { // delete the clips of runs that are neither on the POINTS board nor waiting to be sent (old "clip_" ones are left alone)
+  try {
+    const keep = new Set(leaderboard.map((e) => clipKey(e)).concat(pendingRuns.map((r) => "run_" + r.id)));
+    for (const key of await listVideoKeys()) if (typeof key === "string" && key.startsWith("run_") && !keep.has(key)) await deleteVideoBlob(key);
+  } catch (e) { /* no IndexedDB, or it failed: the clips stay */ }
+}
 
 const CLIP_SECONDS = 25;
 let recorder = null, recordedChunks = [];
@@ -349,9 +517,10 @@ addEventListener("keydown", (e) => {
   if (e.key.length === 1 && (state === "menu" || state === "leaderboard" || state === "naming" || state === "gameover")) {
     leaderboardCodeBuffer = (leaderboardCodeBuffer + e.key).slice(-LEADERBOARD_CLEAR_LENGTH);
     if (leaderboardCodeBuffer.length === LEADERBOARD_CLEAR_LENGTH && hashText(leaderboardCodeBuffer) === LEADERBOARD_CLEAR_HASH) {
+      const typed = leaderboardCodeBuffer;
       leaderboardCodeBuffer = "";
       if (state === "naming") nameInput = playerName; // undo what the code typed into the name field
-      clearLeaderboard();
+      clearLeaderboard(typed);
       return;
     }
   }
@@ -674,30 +843,28 @@ function hitPlayer(b) {
 }
 
 function finishRun() {
-  levelBoard = computeLevelBoardAfter({ name: playerName, level: level, score: score }).kept; // needs no clip, so it is recorded at once
+  const run = { id: newRunId(), name: playerName, level: level, score: score };
+  levelBoard = computeLevelBoardAfter(Object.assign({}, run)).kept; // both boards take the run at once, as they always did
   saveLevelBoard();
-  const entry = { name: playerName, score: score, videoId: null };
+  const entry = Object.assign({}, run);
   const { kept, dropped } = computeLeaderboardAfter(entry);
-  const commit = () => {
-    leaderboard = kept;
-    saveLeaderboard();
-    dropped.forEach((e) => { if (e.videoId) deleteVideoBlob(e.videoId).catch(() => {}); });
-  };
+  leaderboard = kept;
+  saveLeaderboard();
+  dropped.forEach((e) => { const key = clipKey(e); if (key) deleteVideoBlob(key).catch(() => {}); });
   if (recorder && recorder.state !== "inactive" && kept.includes(entry)) {
-    recorder.onstop = () => {
-      const blob = new Blob(recordedChunks, { type: "video/webm" });
-      const videoId = "clip_" + Date.now() + "_" + Math.random().toString(36).slice(2);
-      saveVideoBlob(videoId, blob)
-        .then(() => { entry.videoId = videoId; commit(); })
-        .catch(() => commit());
-    };
+    clipSaving = new Promise((resolve) => { // the clip is kept under run_<id>, so the entry needs no extra field and the thumbnails just wait for it
+      recorder.onstop = () => {
+        const blob = new Blob(recordedChunks, { type: "video/webm" });
+        saveVideoBlob("run_" + run.id, blob).catch(() => {}).then(resolve);
+      };
+    });
     recorder.requestData();
     recorder.stop();
   } else {
     if (recorder && recorder.state !== "inactive") recorder.stop();
     recorder = null;
-    commit();
   }
+  if (sharedBoardsOn()) submitRun(run);
 }
 
 /* ---------------- bug behaviors ---------------- */
@@ -1262,8 +1429,18 @@ function drawNaming(t) {
   } else {
     ctx.fillText("Enter to confirm  •  Esc to cancel  •  up to " + NAME_MAX_LEN + " characters", W / 2, H / 2 + 60);
   }
+  if (sharedBoardsOn()) centerText("Your name and score are shown on the shared leaderboard.", W / 2, touchMode ? H / 2 + 176 : H / 2 + 96, 13, "rgba(255,255,255,0.45)");
 }
 
+function boardStatusLine() { // the small line under the rows in shared mode: is this the live shared board? (null in local-only mode)
+  if (!sharedBoardsOn()) return null;
+  if (boardStatus === "live") return { text: "Shared board", color: "rgba(143,244,255,0.7)" };
+  if (boardStatus === "offline") {
+    const n = pendingRuns.length;
+    return { text: n > 0 ? "Offline — " + n + (n === 1 ? " run" : " runs") + " will be sent later" : "Offline — showing saved scores", color: "#ffb86b" };
+  }
+  return { text: "Updating shared board…", color: "rgba(255,255,255,0.45)" };
+}
 function drawBoardTabs() { // POINTS | LEVELS under the title: the current page is bright and underlined
   ctx.font = "bold 18px 'Segoe UI', sans-serif";
   ctx.textAlign = "center";
@@ -1310,6 +1487,8 @@ function drawLeaderboard(t) { // the POINTS page or the LEVELS page
     }
   });
   if (rows.length === 0) centerText(levels ? "No runs yet — reach a level to get on the board!" : "No runs yet — go set the first score!", W / 2, startY + 40, 18, "rgba(255,255,255,0.6)");
+  const status = boardStatusLine();
+  if (status) centerText(status.text, W / 2, H - 64, 13, status.color);
   const flip = levels ? (touchMode ? "swipe for POINTS" : "↑ or scroll for POINTS") : (touchMode ? "swipe down for LEVELS" : "↓ or scroll for LEVELS");
   centerText(flip + "  •  " + (touchMode ? "tap anywhere to return to the menu" : "L / Esc to return to the menu"), W / 2, H - 40, 14, "rgba(255,255,255,0.5)");
 }
@@ -1646,6 +1825,11 @@ function draw(t) {
     if (Math.floor(t * 2) % 2 === 0) centerText(touchMode ? "Tap to fly again" : "Press ENTER to fly again", W / 2, H / 2 + 92, 20, "#8ff4ff");
   }
   if (isPortrait()) drawPortraitOverlay();
+}
+
+if (sharedBoardsOn()) { // fetch the shared boards now, and again whenever the browser comes back online
+  addEventListener("online", () => { syncBoards(); });
+  syncBoards();
 }
 
 /* ---------------- main loop ---------------- */
